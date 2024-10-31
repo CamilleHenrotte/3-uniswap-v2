@@ -1,12 +1,17 @@
 //SPDX-License-Identifier: MIT
 import {ReentrancyGuard} from "lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {IERC3156FlashBorrower} from "lib/openzeppelin-contracts/contracts/interfaces/IERC3156FlashBorrower.sol";
+import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
+import "forge-std/console.sol"; // Foundry console import
 import "./TransferHelper.sol";
 import "./FixedPointLibrary.sol";
+import "./IUniswapV2Factory.sol";
+import "./MathLibrary.sol";
 
 pragma solidity =0.8.28;
 
-contract UniswapV2Pair is ReentrancyGuard {
+contract UniswapV2Pair is ReentrancyGuard, ERC20 {
     using TransferHelper for address;
     using FixedPointLibrary for FixedPointLibrary.FixedPoint;
 
@@ -15,10 +20,19 @@ contract UniswapV2Pair is ReentrancyGuard {
     error UniswapV2Pair_Expired();
     error UniswapV2Pair_InsufficientInputAmount();
     error UniswapV2Pair_InsufficientOutputAmount();
+    error UniswapV2Pair_InsufficientToken1Amount();
+    error UniswapV2Pair_InsufficientToken0Amount();
     error UniswapV2Pair_EcxessiveInputAmount();
     error UniswapV2Pair_InsufficientLiquidity();
+    error UniswapV2Pair_K();
+    error UniswapV2Pair_InvalidToken();
+    error UniswapV2Pair_TransferFailed();
+    error UniswapV2Pair_CallbackFailed();
+    error UniswapV2Pair_TransferBackFailed();
 
-    uint public constant MINIMUM_LIQUIDITY = 10 ** 3;
+    uint256 public constant MINIMUM_LIQUIDITY = 10 ** 3;
+    uint256 public constant FEE_BASIS_POINTS = 3;
+    bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
 
     address public immutable factory;
     address public token0;
@@ -30,25 +44,18 @@ contract UniswapV2Pair is ReentrancyGuard {
 
     FixedPointLibrary.FixedPoint public price0CumulativeLast;
     FixedPointLibrary.FixedPoint public price1CumulativeLast;
-    uint public kLast; // reserve0 * reserve1, as of immediately after the most recent liquidity event
+    uint256 public kLast; // reserve0 * reserve1, as of immediately after the most recent liquidity event
 
-    event Mint(address indexed sender, uint amount0, uint amount1);
-    event Burn(address indexed sender, uint amount0, uint amount1, address indexed to);
-    event Swap(
-        address indexed sender,
-        uint amount0In,
-        uint amount1In,
-        uint amount0Out,
-        uint amount1Out,
-        address indexed to
-    );
+    event Mint(address indexed sender, uint256 amount0, uint256 amount1);
+    event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);
+    event Swap(address indexed sender, uint256 amountIn, uint256 amountOut, bool inputIsToken0, address indexed to);
     event Sync(uint112 reserve0, uint112 reserve1);
 
     constructor() {
         factory = msg.sender;
     }
 
-    modifier ensure(uint deadline) {
+    modifier ensure(uint256 deadline) {
         if (deadline < block.timestamp) revert UniswapV2Pair_Expired();
         _;
     }
@@ -59,77 +66,155 @@ contract UniswapV2Pair is ReentrancyGuard {
         token1 = _token1;
     }
     function swapExactTokensForTokens(
-        uint amountIn,
-        uint amountOutMin,
+        uint256 amountIn,
+        uint256 amountOutMin,
         bool inputIsToken0,
         address to,
-        uint deadline
-    ) external ensure(deadline) returns (uint[] memory amounts) {
+        uint256 deadline
+    ) external ensure(deadline) nonReentrant returns (uint256 amountOut) {
         (uint112 reserveIn, uint112 reserveOut, address tokenIn) = inputIsToken0
             ? (reserve0, reserve1, token0)
             : (reserve1, reserve0, token1);
-        uint amountOut = getAmountOut(amountIn, reserveIn, reserveOut);
+        amountOut = getAmountOut(amountIn, reserveIn, reserveOut);
         if (amountOut < amountOutMin) revert UniswapV2Pair_InsufficientOutputAmount();
         tokenIn.safeTransferFrom(msg.sender, address(this), amountIn);
-        _swap(amountIn, amountOut, to);
+        _swap(amountOut, inputIsToken0, to);
     }
     function swapTokensForExactTokens(
-        uint amountOut,
-        uint amountInMax,
+        uint256 amountOut,
+        uint256 amountInMax,
         bool inputIsToken0,
         address to,
-        uint deadline
-    ) external ensure(deadline) returns (uint[] memory amounts) {
+        uint256 deadline
+    ) external ensure(deadline) nonReentrant returns (uint256 amountIn) {
         (uint112 reserveIn, uint112 reserveOut, address tokenIn) = inputIsToken0
             ? (reserve0, reserve1, token0)
             : (reserve1, reserve0, token1);
-        uint amountIn = getAmountIn(amountOut, reserveIn, reserveOut);
+        amountIn = getAmountIn(amountOut, reserveIn, reserveOut);
         if (amountIn > amountInMax) revert UniswapV2Pair_EcxessiveInputAmount();
         tokenIn.safeTransferFrom(msg.sender, address(this), amountIn);
-        _swap(amountIn, amountOut, to);
+        _swap(amountOut, inputIsToken0, to);
+    }
+    function addLiquidity(
+        uint256 amount0Desired,
+        uint256 amount1Desired,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        address to,
+        uint256 deadline
+    ) external ensure(deadline) nonReentrant returns (uint256 amount0, uint256 amount1, uint256 liquidity) {
+        if (reserve0 == 0 && reserve1 == 0) {
+            (amount0, amount1) = (amount0Desired, amount1Desired);
+        } else {
+            uint256 amount1Optimal = quote(amount0Desired, reserve0, reserve1);
+            if (amount1Optimal <= amount1Desired) {
+                if (amount1Optimal < amount1Min) revert UniswapV2Pair_InsufficientToken1Amount();
+                (amount0, amount1) = (amount0Desired, amount1Optimal);
+            } else {
+                uint256 amount0Optimal = quote(amount1Desired, reserve0, reserve1);
+                if (amount0Optimal > amount0Desired) revert UniswapV2Pair_InsufficientLiquidity();
+                if (amount0Optimal < amount0Min) revert UniswapV2Pair_InsufficientToken0Amount();
+                (amount0, amount1) = (amount0Optimal, amount1Desired);
+            }
+        }
+        token0.safeTransferFrom(msg.sender, address(this), amount0);
+        token1.safeTransferFrom(msg.sender, address(this), amount1);
+        liquidity = _mint(to);
+    }
+    function removeLiquidity(
+        uint256 liquidity,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        address to,
+        uint256 deadline
+    ) external nonReentrant ensure(deadline) returns (uint256 amount0, uint256 amount1) {
+        transferFrom(msg.sender, address(this), 1);
+        (amount0, amount1) = _burn(to);
+        if (amount0 < amount0Min || amount1 < amount1Min) revert UniswapV2Pair_InsufficientLiquidity();
+    }
+    function flashLoan(
+        IERC3156FlashBorrower receiver,
+        address token,
+        uint256 amount,
+        bytes calldata data
+    ) external nonReentrant returns (bool) {
+        uint256 fee = flashFee(token, amount);
+        bool transferSuccess = IERC20(token).transfer(address(receiver), amount);
+        if (!transferSuccess) revert UniswapV2Pair_TransferFailed();
+        bytes32 callbackSuccess = receiver.onFlashLoan(msg.sender, token, amount, fee, data);
+        if (callbackSuccess != CALLBACK_SUCCESS) revert UniswapV2Pair_CallbackFailed();
+        bool transferBackSuccess = IERC20(token).transferFrom(address(receiver), address(this), amount + fee);
+        if (!transferBackSuccess) revert UniswapV2Pair_TransferBackFailed();
+        return true;
+    }
+    function maxFlashLoan(address token) external view returns (uint256) {
+        if (token == token0) return (reserve0);
+        else if (token == token1) return (reserve1);
+        else {
+            revert UniswapV2Pair_InvalidToken();
+        }
+    }
+    function skim(address to) external {
+        address _token0 = token0;
+        address _token1 = token1;
+        _token0.safeTransfer(to, IERC20(_token0).balanceOf(address(this)) - (reserve0));
+        _token1.safeTransfer(to, IERC20(_token1).balanceOf(address(this)) - (reserve1));
+    }
+    function sync() external {
+        _update(IERC20(token0).balanceOf(address(this)), IERC20(token1).balanceOf(address(this)), reserve0, reserve1);
     }
 
-    function getReserves() external view returns (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast) {
+    function name() public view virtual override returns (string memory) {
+        return "Uniswap V2 Liquidity Token";
+    }
+    function symbol() public view virtual override returns (string memory) {
+        return "UNI-V2";
+    }
+    function flashFee(address token, uint256 amount) public view returns (uint256) {
+        if (token != token0 && token != token1) revert UniswapV2Pair_InvalidToken();
+        return (amount * 3) / 1000;
+    }
+    function getReserves() public view returns (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast) {
         _reserve0 = reserve0;
         _reserve1 = reserve1;
         _blockTimestampLast = blockTimestampLast;
     }
     // given an input amount of an asset and pair reserves, returns the maximum output amount of the other asset
-    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) internal pure returns (uint amountOut) {
+    function getAmountOut(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) public pure returns (uint256 amountOut) {
         if (amountIn <= 0) revert UniswapV2Pair_InsufficientInputAmount();
         if (reserveIn <= 0 || reserveOut <= 0) revert UniswapV2Pair_InsufficientLiquidity();
-        uint amountInWithFee = amountIn * 997;
-        uint numerator = amountInWithFee * reserveOut;
-        uint denominator = reserveIn * 1000 + amountInWithFee;
+        uint256 amountInWithFee = amountIn * 997;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = reserveIn * 1000 + amountInWithFee;
         amountOut = numerator / denominator;
     }
-
     // given an output amount of an asset and pair reserves, returns a required input amount of the other asset
-    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) internal pure returns (uint amountIn) {
+    function getAmountIn(
+        uint256 amountOut,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) public pure returns (uint256 amountIn) {
         if (amountOut <= 0) revert UniswapV2Pair_InsufficientOutputAmount();
         if (reserveIn <= 0 || reserveOut <= 0) revert UniswapV2Pair_InsufficientLiquidity();
-        uint numerator = reserveIn * amountOut * 1000;
-        uint denominator = (reserveOut - amountOut) * 997;
+        uint256 numerator = reserveIn * amountOut * 1000;
+        uint256 denominator = (reserveOut - amountOut) * 997;
         amountIn = (numerator / denominator) + 1;
     }
-
-    // force balances to match reserves
-    function skim(address to) external nonReentrant {
-        address _token0 = token0; // gas savings
-        address _token1 = token1; // gas savings
-        _token0.safeTransfer(to, IERC20(_token0).balanceOf(address(this)) - (reserve0));
-        _token1.safeTransfer(to, IERC20(_token1).balanceOf(address(this)) - (reserve1));
+    // given some amount of an asset and pair reserves, returns an equivalent amount of the other asset
+    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) public pure returns (uint256 amountB) {
+        if (amountA <= 0) revert UniswapV2Pair_InsufficientInputAmount();
+        if (reserveA <= 0 || reserveB <= 0) revert UniswapV2Pair_InsufficientLiquidity();
+        amountB = (amountA * reserveB) / reserveA;
     }
 
-    // force reserves to match balances
-    function sync() external nonReentrant {
-        _update(IERC20(token0).balanceOf(address(this)), IERC20(token1).balanceOf(address(this)), reserve0, reserve1);
-    }
-
-    function _update(uint balance0, uint balance1, uint112 _reserve0, uint112 _reserve1) internal {
+    function _update(uint256 balance0, uint256 balance1, uint112 _reserve0, uint112 _reserve1) internal {
         if (balance0 > type(uint112).max || balance1 > type(uint112).max) revert UniswapV2Pair_Overflow();
         FixedPointLibrary.FixedPoint memory timeElapsed = FixedPointLibrary.FixedPoint({
-            integer: uint112(uint32((block.timestamp) - blockTimestampLast)),
+            integer: uint112(uint32((block.timestamp - blockTimestampLast))),
             decimal: 0
         });
         blockTimestampLast = uint32(block.timestamp);
@@ -145,10 +230,84 @@ contract UniswapV2Pair is ReentrancyGuard {
             price0CumulativeLast = price0CumulativeLast.add(timeElapsed.mul(uq_reserv0.div(uq_reserv1)));
             price0CumulativeLast = price1CumulativeLast.add(timeElapsed.mul(uq_reserv1.div(uq_reserv0)));
         }
-
         reserve0 = uint112(balance0);
         reserve1 = uint112(balance1);
         emit Sync(reserve0, reserve1);
     }
-    function _swap(uint amount0Out, uint amount1Out, address to) internal nonReentrant {}
+    function _swap(uint256 amountOut, bool inputIsToken0, address to) internal {
+        (uint112 reserveIn, uint112 reserveOut, address tokenOut) = inputIsToken0
+            ? (reserve0, reserve1, token1)
+            : (reserve1, reserve0, token0);
+        tokenOut.safeTransfer(to, amountOut);
+        uint256 balance0 = IERC20(token0).balanceOf(address(this));
+        uint256 balance1 = IERC20(token1).balanceOf(address(this));
+        (uint256 balanceIn, uint256 balanceOut) = inputIsToken0 ? (balance0, balance1) : (balance1, balance0);
+        if (balanceIn < reserveIn) revert UniswapV2Pair_InsufficientInputAmount();
+        uint256 amountIn = balanceIn - reserveIn;
+        {
+            uint256 leftSide = (((1000 * balanceIn - FEE_BASIS_POINTS * amountIn) / 1_000_000_000) * balanceOut);
+            uint256 rightSide = (((1000 * reserveIn) / 1_000_000_000) * reserveOut);
+            if (leftSide < rightSide) revert UniswapV2Pair_K();
+        }
+        _update(balance0, balance1, reserve0, reserve1);
+        emit Swap(msg.sender, amountIn, amountOut, inputIsToken0, to);
+    }
+
+    function _mint(address to) internal returns (uint256 liquidity) {
+        uint256 balance0 = IERC20(token0).balanceOf(address(this));
+        uint256 balance1 = IERC20(token1).balanceOf(address(this));
+        (uint112 _reserve0, uint112 _reserve1, ) = getReserves();
+        uint256 amount0 = balance0 - _reserve0;
+        uint256 amount1 = balance1 - _reserve1;
+        uint256 _totalSupply = totalSupply();
+        if (_totalSupply == 0) {
+            liquidity = MathLibrary.sqrt(amount0 * amount1) - MINIMUM_LIQUIDITY;
+            _mint(address(0), MINIMUM_LIQUIDITY); // permanently lock the first MINIMUM_LIQUIDITY tokens
+        } else {
+            liquidity = MathLibrary.min((amount0 * _totalSupply) / _reserve0, (amount1 * _totalSupply) / _reserve1);
+        }
+        if (liquidity <= 0) revert UniswapV2Pair_InsufficientLiquidity();
+        bool feeOn = _mintFee(_reserve0, _reserve1);
+        _update(balance0, balance1, _reserve0, _reserve1);
+        _mint(to, liquidity);
+        if (feeOn) kLast = reserve0 * reserve1;
+        emit Mint(msg.sender, amount0, amount1);
+    }
+    function _mintFee(uint112 _reserve0, uint112 _reserve1) private returns (bool feeOn) {
+        address feeTo = IUniswapV2Factory(factory).feeTo();
+        feeOn = feeTo != address(0);
+        uint256 _kLast = kLast; // gas savings
+        if (feeOn) {
+            if (_kLast != 0) {
+                uint256 rootK = MathLibrary.sqrt(_reserve0 * _reserve1);
+                uint256 rootKLast = MathLibrary.sqrt(_kLast);
+                uint256 liquidity = (totalSupply() * (rootKLast - rootK)) / (5 * rootKLast + rootK);
+                transfer(feeTo, liquidity);
+            }
+        } else if (_kLast != 0) {
+            kLast = 0;
+        }
+    }
+    function _burn(address to) internal returns (uint256 amount0, uint256 amount1) {
+        (uint112 _reserve0, uint112 _reserve1, ) = getReserves(); // gas savings
+        address _token0 = token0; // gas savings
+        address _token1 = token1;
+        bool feeOn = _mintFee(_reserve0, _reserve1);
+        uint256 _totalSupply = totalSupply(); // gas savings
+        uint256 balance0 = IERC20(_token0).balanceOf(address(this));
+        uint256 balance1 = IERC20(_token1).balanceOf(address(this));
+        uint256 liquidity = balanceOf(address(this));
+        if (liquidity == 0) revert UniswapV2Pair_InsufficientLiquidity();
+        amount0 = (liquidity * _reserve0) / _totalSupply;
+        amount1 = (liquidity * _reserve1) / _totalSupply;
+        if (amount0 <= 0 || amount1 <= 0) revert UniswapV2Pair_InsufficientLiquidity();
+        token0.safeTransfer(to, amount0);
+        token1.safeTransfer(to, amount1);
+        _burn(address(this), liquidity);
+        balance0 = IERC20(_token0).balanceOf(address(this));
+        balance1 = IERC20(_token1).balanceOf(address(this));
+        _update(balance0, balance1, _reserve0, _reserve1);
+        if (feeOn) kLast = reserve0 * reserve1;
+        emit Burn(msg.sender, amount0, amount1, to);
+    }
 }

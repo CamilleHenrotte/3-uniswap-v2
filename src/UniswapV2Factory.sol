@@ -6,6 +6,9 @@ import "./UniswapV2Pair.sol";
 contract UniswapV2Factory {
     error UniswapV2Factory_Forbidden();
     error UniswapV2Factory_PairExists();
+    error UniswapV2Factory_IdenticalAddresses();
+    error UniswapV2Factory_ZeroAddress();
+
     address public feeTo;
     address public feeToSetter;
 
@@ -21,6 +24,14 @@ contract UniswapV2Factory {
         if (_isContract(pair)) {
             revert UniswapV2Factory_PairExists();
         } else {
+            bytes memory bytecode = abi.encodePacked(type(UniswapV2Pair).creationCode);
+            bytes32 salt = keccak256(abi.encodePacked(token0, token1));
+            assembly {
+                pair := create2(0, add(bytecode, 0x20), mload(bytecode), salt)
+                if iszero(extcodesize(pair)) {
+                    revert(0, 0)
+                }
+            }
             UniswapV2Pair(pair).initialize(token0, token1);
             emit PairCreated(token0, token1, pair);
         }
@@ -38,11 +49,11 @@ contract UniswapV2Factory {
     }
     function _sortTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
         if (tokenA == tokenB) {
-            revert UniswapV2Library_IdenticalAddresses();
+            revert UniswapV2Factory_IdenticalAddresses();
         }
         (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
         if (token0 == address(0)) {
-            revert UniswapV2Library_ZeroAddress();
+            revert UniswapV2Factory_ZeroAddress();
         }
     }
 
