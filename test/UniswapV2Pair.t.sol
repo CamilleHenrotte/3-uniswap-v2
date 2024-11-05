@@ -122,8 +122,6 @@ contract UniswapV2PairTest is Test {
         (uint256 reserve0Before, uint256 reserve1Before, ) = pair.getReserves();
         uint256 balancePairBefore = pair.balanceOf(USER);
         vm.prank(USER);
-        pair.approve(address(pair), AMOUNT_TO_BURN);
-        vm.prank(USER);
         pair.removeLiquidity(AMOUNT_TO_BURN, 0, 0, USER, block.timestamp + 5);
         uint256 balance0After = token0.balanceOf(USER);
         uint256 balance1After = token1.balanceOf(USER);

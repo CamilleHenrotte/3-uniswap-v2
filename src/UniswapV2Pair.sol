@@ -3,7 +3,6 @@ import {ReentrancyGuard} from "lib/openzeppelin-contracts/contracts/utils/Reentr
 import {IERC20} from "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {IERC3156FlashBorrower} from "lib/openzeppelin-contracts/contracts/interfaces/IERC3156FlashBorrower.sol";
 import {ERC20} from "lib/solady/src/tokens/ERC20.sol";
-import "forge-std/console.sol"; // Foundry console import
 import "./TransferHelper.sol";
 import "./FixedPointLibrary.sol";
 import "./IUniswapV2Factory.sol";
@@ -128,8 +127,7 @@ contract UniswapV2Pair is ReentrancyGuard, ERC20 {
         address to,
         uint256 deadline
     ) external nonReentrant ensure(deadline) returns (uint256 amount0, uint256 amount1) {
-        transferFrom(msg.sender, address(this), 1);
-        (amount0, amount1) = _burn(to);
+        (amount0, amount1) = _burnLiquidity(to, liquidity);
         if (amount0 < amount0Min || amount1 < amount1Min) revert UniswapV2Pair_InsufficientLiquidity();
     }
     function flashLoan(
@@ -138,6 +136,7 @@ contract UniswapV2Pair is ReentrancyGuard, ERC20 {
         uint256 amount,
         bytes calldata data
     ) external nonReentrant returns (bool) {
+        (uint112 reserve0, uint112 reserve1, ) = getReserves();
         uint256 fee = flashFee(token, amount);
         bool transferSuccess = IERC20(token).transfer(address(receiver), amount);
         if (!transferSuccess) revert UniswapV2Pair_TransferFailed();
@@ -145,16 +144,19 @@ contract UniswapV2Pair is ReentrancyGuard, ERC20 {
         if (callbackSuccess != CALLBACK_SUCCESS) revert UniswapV2Pair_CallbackFailed();
         bool transferBackSuccess = IERC20(token).transferFrom(address(receiver), address(this), amount + fee);
         if (!transferBackSuccess) revert UniswapV2Pair_TransferBackFailed();
+        uint256 balance0 = IERC20(token).balanceOf(address(this));
+        uint256 balance1 = IERC20(token).balanceOf(address(this));
+        _update(balance0, balance1, reserve0, reserve1);
         return true;
     }
-    function maxFlashLoan(address token) external view returns (uint256) {
+    function maxFlashLoan(address token) external nonReentrant returns (uint256) {
         if (token == token0) return (reserve0);
         else if (token == token1) return (reserve1);
         else {
             revert UniswapV2Pair_InvalidToken();
         }
     }
-    function skim(address to) external {
+    function skim(address to) external nonReentrant {
         address _token0 = token0;
         address _token1 = token1;
         _token0.safeTransfer(to, IERC20(_token0).balanceOf(address(this)) - (reserve0));
@@ -288,7 +290,7 @@ contract UniswapV2Pair is ReentrancyGuard, ERC20 {
             kLast = 0;
         }
     }
-    function _burn(address to) internal returns (uint256 amount0, uint256 amount1) {
+    function _burnLiquidity(address to, uint256 liquidity) internal returns (uint256 amount0, uint256 amount1) {
         (uint112 _reserve0, uint112 _reserve1, ) = getReserves(); // gas savings
         address _token0 = token0; // gas savings
         address _token1 = token1;
@@ -296,14 +298,13 @@ contract UniswapV2Pair is ReentrancyGuard, ERC20 {
         uint256 _totalSupply = totalSupply(); // gas savings
         uint256 balance0 = IERC20(_token0).balanceOf(address(this));
         uint256 balance1 = IERC20(_token1).balanceOf(address(this));
-        uint256 liquidity = balanceOf(address(this));
-        if (liquidity == 0) revert UniswapV2Pair_InsufficientLiquidity();
         amount0 = (liquidity * _reserve0) / _totalSupply;
         amount1 = (liquidity * _reserve1) / _totalSupply;
+        if (balanceOf(msg.sender) <= liquidity) revert UniswapV2Pair_InsufficientLiquidity();
         if (amount0 <= 0 || amount1 <= 0) revert UniswapV2Pair_InsufficientLiquidity();
         token0.safeTransfer(to, amount0);
         token1.safeTransfer(to, amount1);
-        _burn(address(this), liquidity);
+        _burn(msg.sender, liquidity);
         balance0 = IERC20(_token0).balanceOf(address(this));
         balance1 = IERC20(_token1).balanceOf(address(this));
         _update(balance0, balance1, _reserve0, _reserve1);
